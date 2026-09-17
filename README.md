@@ -42,6 +42,9 @@ cargo run --release -- --out=/path/to/out/ --pdb=/path/to/file.pdb --base-addres
 | `-o` | `--out <out>` | The output directory to dump all C++ code to. |
 | `-p` | `--pdb <pdb>` | The file path to the MSVC PDB file to decompile. |
 | | `--pseudocode-json-path <pseudocode-json-path>` | The file containing all function pseudocode in a JSON mapping. (Optional) |
+| | `--project-name` | The file and folder name for used to generate the umbrella include header. The emitted include is `{project_name}/{project_name}.h` (e.g. `project/project.h`). |
+| | `--include-compiler-generated` | Includes compiler-generated procedure definitions (implicit ctors/dtors/assignment, thunks, dynamic initializers) in output C++ code |
+| | `--source-path <source-path>` | A source file path (or directory) to filter which modules are decompiled. Only modules whose source path is equal to, or nested under, one of these paths are exported. Can be specified multiple times. For a directory path, output is rebased so the last folder becomes the output root (e.g. `--source-path .../FolderA/SubFolderA` writes `.../FolderA/SubFolderA/foo.cpp` to `<out>/SubFolderA/foo.cpp`). |
 
 ## Contributing
 

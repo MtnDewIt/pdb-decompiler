@@ -747,14 +747,16 @@ impl Class {
                 // TODO: does this need handling?
             }
 
-            // Drop compiler-generated members (implicit ctor/dtor/assignment, and the special
-            // members of anonymous types): they were never written in source. `compgenx` and
-            // `pseudo` mark them; anonymous-type special members additionally carry the
-            // `<unnamed-type-*>` placeholder name.
+            // Drop only the special members of an ANONYMOUS type: their name carries the
+            // `<unnamed-type-*>` placeholder, which was never valid C++ and cannot be
+            // declared anywhere. Upstream also drops `pseudo`/`compgenx` members here;
+            // Project Hades keeps them, because the definitions are kept (see the
+            // matching note in `decompile.rs`) and a definition needs its declaration.
             pdb2::TypeData::Method(ref data)
-                if data.attributes.is_pseudo()
-                    || data.attributes.is_compgenx()
-                    || data.name.to_string().contains("<unnamed") => (),
+                if data.name.to_string().contains("<unnamed")
+                    || ((self.name.is_empty() || self.name.contains("<unnamed"))
+                        && (data.attributes.is_pseudo()
+                            || data.attributes.is_compgenx())) => (),
 
             pdb2::TypeData::Method(ref data) => match data.name.to_string().to_string().as_str() {
                 // Ignore compiler-generated functions:
@@ -817,8 +819,11 @@ impl Class {
                             match data.name.to_string().to_string().as_str() {
                                 "__vecDelDtor" | "__local_vftable_ctor_closure" | "__autoclassinit" => (),
 
-                                // Drop compiler-generated overloads (see the `Method` arm).
-                                _ if attributes.is_pseudo() || attributes.is_compgenx() => (),
+                                // Compiler-generated overloads are KEPT here unless the
+                                // enclosing type is anonymous - see the `Method` arm.
+                                _ if (self.name.is_empty() || self.name.contains("<unnamed"))
+                                    && (attributes.is_pseudo()
+                                        || attributes.is_compgenx()) => (),
 
                                 _ => {
                                     let method = match type_finder.find(method_type)?.parse() {

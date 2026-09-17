@@ -430,6 +430,7 @@ pub fn reorganize_module_members(
     type_finder: &pdb2::TypeFinder,
     module: &mut cpp::Module,
     compound_enums: &[(cpp::Enum, cpp::TypeDefinition)],
+    project_name: &str,
 ) -> pdb2::Result<()> {
     //
     // Rebuild module under specific sections
@@ -536,7 +537,7 @@ pub fn reorganize_module_members(
     new_members.push(cpp::ModuleMember::EmptyLine);
 
     if !module.is_header() {
-        new_members.push(cpp::ModuleMember::Include(false, "ares/ares.h".into()));
+        new_members.push(cpp::ModuleMember::Include(false, format!("{project_name}/{project_name}.h").into()));
     }
 
     if !module.headers.is_empty() {

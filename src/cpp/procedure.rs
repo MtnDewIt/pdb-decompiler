@@ -237,12 +237,20 @@ impl Display for Procedure {
 
         match self.body.as_ref() {
             Some(body) => {
+                // Project Hades anchors every index on this comment; it must stay
+                // last on the line.
+                if self.address != 0 {
+                    write!(f, " // 0x{:X}", self.address)?;
+                }
                 writeln!(f)?;
                 write!(f, "{}", TabbedDisplayer(0, body))?;
             },
 
             None => {
                 write!(f, ";")?;
+                if self.address != 0 {
+                    write!(f, " // 0x{:X}", self.address)?;
+                }
             }
         }
 

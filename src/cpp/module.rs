@@ -133,9 +133,9 @@ impl fmt::Display for ModuleMember {
                 f,
                 "#include {}",
                 if *global {
-                    format!("<{}>", path.to_string_lossy().trim_start_matches('/'))
+                    format!("<{}>", path.to_string_lossy().trim_start_matches(['/', '\\']))
                 } else {
-                    format!("\"{}\"", path.to_string_lossy().trim_start_matches('/'))
+                    format!("\"{}\"", path.to_string_lossy().trim_start_matches(['/', '\\']))
                 },
             ),
             Self::Comment(c) => write!(f, "/* {c} */"),
@@ -2109,9 +2109,9 @@ impl fmt::Display for Module {
 
         for (header, is_global) in self.headers.iter() {
             if *is_global {
-                writeln!(f, "#include <{}>", header.to_string_lossy().trim_start_matches('/'))?;
+                writeln!(f, "#include <{}>", header.to_string_lossy().trim_start_matches(['/', '\\']))?;
             } else {
-                writeln!(f, "#include \"{}\"", header.to_string_lossy().trim_start_matches('/'))?;
+                writeln!(f, "#include \"{}\"", header.to_string_lossy().trim_start_matches(['/', '\\']))?;
             }
         }
 

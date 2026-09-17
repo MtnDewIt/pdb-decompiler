@@ -15,6 +15,16 @@ pub struct Options {
     #[structopt(short, long)]
     pub pdb: Option<PathBuf>,
 
+    /// A source file path (or directory) to filter which modules are decompiled.
+    /// Only modules whose source path is equal to, or nested under, one of these
+    /// paths are exported. Can be specified multiple times.
+    ///
+    /// For a directory path, the output is rebased so the last folder of the path
+    /// becomes the output root. E.g. `--source-path .../FolderA/SubFolderA` writes
+    /// `.../FolderA/SubFolderA/foo.cpp` to `<out>/SubFolderA/foo.cpp`.
+    #[structopt(long = "source-path", parse(from_os_str))]
+    pub source_paths: Vec<PathBuf>,
+
     /// The base address to add when resolving an RVA. (Optional)
     #[structopt(short, long, parse(try_from_str = parse_base_address))]
     pub base_address: Option<u64>,
@@ -66,6 +76,16 @@ pub struct Options {
     /// Whether to reorganize generated C++ code to Bungie's coding standards. (Experimental)
     #[structopt(short, long)]
     pub reorganize: bool,
+
+    /// The project name used to generate the umbrella include header. The emitted
+    /// include is `{project_name}/{project_name}.h` (e.g. `project/project.h`).
+    #[structopt(long = "project-name", default_value = "project")]
+    pub project_name: String,
+
+    /// Includes compiler-generated procedure definitions (implicit
+    /// ctors/dtors/assignment, thunks, dynamic initializers) in output C++ code.
+    #[structopt(long)]
+    pub include_compiler_generated: bool,
 
     /// Forces a `__declspec(noinline)` attribute for functions that were never inlined but did not have the attribute.
     #[structopt(long)]

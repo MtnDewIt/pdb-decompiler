@@ -67,6 +67,69 @@ impl Decompiler {
         self
     }
 
+    /// Computes the output path for a module, rebased relative to a matching
+    /// `--source-path` filter. This is used **only** when writing output `.cpp`
+    /// files; the module's own `path` (used for internal references) is left
+    /// untouched.
+    ///
+    /// When no `--source-path` filters are configured, the module path is
+    /// returned unchanged. Otherwise, the module is kept only if its (sanitized)
+    /// path is equal to, or nested under, one of the given paths (case-insensitive,
+    /// tolerating trailing slashes). The returned path is the last folder of the
+    /// matched source path followed by the module's components after that prefix,
+    /// so `.../FolderA/SubFolderA/foo.cpp` becomes `SubFolderA/foo.cpp`. Returns
+    /// `None` when the module does not match any filter.
+    #[inline(always)]
+    fn rebase_output_path(source_paths: &[PathBuf], module_path: &PathBuf) -> Option<PathBuf> {
+        if source_paths.is_empty() {
+            return Some(module_path.clone());
+        }
+
+        let sanitized = crate::utils::sanitize_path(&module_path.to_string_lossy());
+        let components = sanitized
+            .split(|c| c == '/' || c == '\\')
+            .filter(|component| !component.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let lowercased = components
+            .iter()
+            .map(|component| component.to_lowercase())
+            .collect::<Vec<_>>();
+
+        for source_path in source_paths {
+            let sp_sanitized = crate::utils::sanitize_path(&source_path.to_string_lossy());
+            let sp_components = sp_sanitized
+                .split(|c| c == '/' || c == '\\')
+                .filter(|component| !component.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let Some(last_component) = sp_components.last() else {
+                continue;
+            };
+            let sp_lowercased = sp_components
+                .iter()
+                .map(|component| component.to_lowercase())
+                .collect::<Vec<_>>();
+
+            if lowercased.len() < sp_lowercased.len() {
+                continue;
+            }
+
+            if lowercased[..sp_lowercased.len()] != sp_lowercased[..] {
+                continue;
+            }
+
+            let rebased = std::iter::once(last_component.as_str())
+                .chain(components[sp_lowercased.len()..].iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join("/");
+
+            return Some(PathBuf::from(rebased));
+        }
+
+        None
+    }
+
     #[inline(always)]
     pub fn decompile(&mut self) -> Result<(), Box<dyn Error>> {
         let pdb_path = self.options.pdb.clone()
@@ -360,7 +423,7 @@ impl Decompiler {
             }
         };
 
-        if let Err(e) = write!(file, "{module}") {
+        if let Err(e) = write!(file, "{}", cpp::compact_std_templates(&cpp::shorten_std_aliases(&module.to_string()))) {
             panic!("{e}");
         }
 
@@ -945,7 +1008,19 @@ impl Decompiler {
             _ => None,
         };
 
+        let source_paths = &self.options.source_paths;
+
         for module in self.modules.values_mut() {
+            // Compute the rebased output path (skip modules that don't match a filter).
+            let rebased_path = {
+                let module_ref = module.borrow();
+                Self::rebase_output_path(source_paths, &module_ref.path)
+            };
+
+            let Some(rebased_path) = rebased_path else {
+                continue;
+            };
+
             let mut module = module.borrow_mut();
 
             let mut path = PathBuf::new();
@@ -959,7 +1034,7 @@ impl Decompiler {
                 PathBuf::from(crate::utils::sanitize_path(format!(
                     "{}/{}",
                     out_path.display(),
-                    module.path.to_string_lossy().trim_start_matches('/'),
+                    rebased_path.to_string_lossy().trim_start_matches('/'),
                 )))
                     .components(),
             );
@@ -973,6 +1048,7 @@ impl Decompiler {
                     &context.type_finder,
                     &mut module,
                     compound_enums.as_slice(),
+                    self.options.project_name.as_str(),
                 )?;
             }
 
@@ -1012,7 +1088,9 @@ impl Decompiler {
                     }
                 };
 
-                if let Err(e) = write!(file, "{module}") {
+                if let Err(e) = write!(
+                    file, "{}", cpp::compact_std_templates(&cpp::shorten_std_aliases(&module.to_string()))
+                ) {
                     panic!("Failed to write to file: \"{}\" - {e}", path.display());
                 }
             }
@@ -1048,6 +1126,7 @@ impl Decompiler {
         let mut global_symbols_iter = context.global_symbols.iter();
         let mut module_global_symbols = HashMap::new();
         let mut prev_module_name = None;
+        let mut unhandled_symbol_kinds = HashSet::new();
 
         loop {
             let symbol = match global_symbols_iter.next() {
@@ -1150,7 +1229,16 @@ impl Decompiler {
                     }
                 }
 
-                _ => todo!("{:#?}", symbol_data),
+                // A global UDT encountered before any module attribution cannot be
+                // assigned to a module, so there is nowhere to put it. Skip it
+                // rather than aborting the whole run.
+                pdb2::SymbolData::UserDefinedType(_) => {}
+
+                _ => {
+                    if unhandled_symbol_kinds.insert(std::mem::discriminant(&symbol_data)) {
+                        println!("WARNING: unhandled global symbol kind, skipping: {symbol_data:#?}");
+                    }
+                }
             }
         }
 
@@ -1558,7 +1646,7 @@ impl Decompiler {
                     is_extern: false,
                     name: data_name,
                     signature: format!(
-                        "{};",
+                        "{}; // 0x{address:X}",
                         cpp::type_name(
                             &mut self.class_table,
                             &mut self.type_sizes,
@@ -1669,7 +1757,7 @@ impl Decompiler {
                     is_static: !thread_storage_symbol.global,
                     name: name.clone(),
                     signature: format!(
-                        "thread_local {};",
+                        "thread_local {}; // 0x{address:X}",
                         cpp::type_name(
                             &mut self.class_table,
                             &mut self.type_sizes,
@@ -2257,8 +2345,10 @@ impl Decompiler {
                 // Drop compiler-generated procedure definitions (implicit ctors/dtors/assignment,
                 // thunks, dynamic initializers): they have no source line and were never written
                 // in source. This matches dropping their declarations in `Class::add_member`.
-                if procedure.line.is_none() {
-                    return Ok(());
+                if !self.options.include_compiler_generated {
+                    if procedure.line.is_none() {
+                        return Ok(());
+                    }
                 }
 
                 if let Some(script_file) = self.script_file.as_mut() {
