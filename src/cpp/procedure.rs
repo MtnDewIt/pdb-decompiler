@@ -170,11 +170,7 @@ impl TabbedDisplay for Block {
                 continue;
             }
 
-            match statement {
-                Statement::Label(_) => "".tabbed_fmt(depth, f)?,
-                Statement::Commented(x) if matches!(x.as_ref(), Statement::Label(_)) => "".tabbed_fmt(depth, f)?,
-                _ => "".tabbed_fmt(depth + 1, f)?,
-            }
+            "".tabbed_fmt(depth + 1, f)?;
             statement.tabbed_fmt(depth + 1, f)?;
             writeln!(f)?;
         }

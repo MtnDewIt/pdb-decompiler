@@ -3137,7 +3137,7 @@ impl Decompiler {
                             nested_class.base_classes = other_class.borrow().base_classes.clone();
                             nested_class.members = other_class.borrow().members.clone();
 
-                            let nested_depth = nested_class.depth + 1;
+                            let nested_depth = nested_class.member_indent_level();
 
                             for member in nested_class.members.iter_mut() {
                                 match member {

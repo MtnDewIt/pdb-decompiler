@@ -58,7 +58,7 @@ pub enum ModuleMember {
 /// no explicit `EmptyLine` members are present, before the first kind change) — the
 /// caller sets it so nothing separates the members from the `{`/header above them.
 fn write_member_sequence(
-    f: &mut fmt::Formatter<'_>,
+    f: &mut impl fmt::Write,
     members: &[ModuleMember],
     mut skip_empty_line: bool,
 ) -> fmt::Result {
@@ -114,7 +114,7 @@ fn write_member_sequence(
             }
         }
 
-        fmt::Display::fmt(item, f)?;
+        write!(f, "{}", item)?;
         writeln!(f)?;
 
         prev_item = Some(item);
@@ -147,9 +147,18 @@ impl fmt::Display for ModuleMember {
 
                 writeln!(f, "{{")?;
 
-                // Same spacing rules as top-level output: pack consecutive same-kind
-                // members, blank line between differing kinds; no blank after the `{`.
-                write_member_sequence(f, members, true)?;
+                // Render the members to a buffer, then indent each line inside the
+                // namespace body by one level.
+                let mut body = String::new();
+                write_member_sequence(&mut body, members, true)?;
+
+                for line in body.lines() {
+                    if line.is_empty() {
+                        writeln!(f)?;
+                    } else {
+                        writeln!(f, "    {line}")?;
+                    }
+                }
 
                 write!(f, "}}")
             },

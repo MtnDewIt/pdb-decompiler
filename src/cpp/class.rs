@@ -946,7 +946,7 @@ impl Class {
                             is_declaration: false,
                             name: nested_data.name.to_string().to_string(),
                             index: nested_data.nested_type,
-                            depth: self.depth + 1,
+                            depth: self.member_indent_level(),
                             line: 0,
                             size: size,
                             base_classes: vec![],
@@ -995,7 +995,7 @@ impl Class {
                         let mut definition = Enum {
                             name: nested_data.name.to_string().to_string(),
                             index: nested_data.nested_type,
-                            depth: self.depth + 1,
+                            depth: self.member_indent_level(),
                             line: 0,
                             underlying_type_name: type_name(
                                 class_table,
@@ -1093,6 +1093,17 @@ impl Class {
 
         Ok(())
     }
+
+    /// The indentation level of this class's members. Structs and unions don't emit
+    /// access specifiers, so their members sit one level shallower than a class's,
+    /// whose members are indented under `public:`/`private:`/`protected:`.
+    pub fn member_indent_level(&self) -> u32 {
+        if matches!(self.kind, Some(pdb2::ClassKind::Struct)) || self.is_union {
+            self.depth + 1
+        } else {
+            self.depth + 2
+        }
+    }
 }
 
 impl fmt::Display for Class {
@@ -1133,18 +1144,10 @@ impl fmt::Display for Class {
         if !self.base_classes.is_empty() {
             let last_base_class_index = self.base_classes.len() - 1;
 
+            write!(f, " :")?;
+
             for (i, base) in self.base_classes.iter().enumerate() {
-                if i == 0 {
-                    writeln!(f, " :")?;
-                } else {
-                    writeln!(f)?;
-                }
-                        
-                for _ in 0..self.depth {
-                    write!(f, "    ")?;
-                }
-                
-                write!(f, "    {}{}", base.type_name, if i == last_base_class_index { "" } else { "," })?;
+                write!(f, " {}{}", base.type_name, if i == last_base_class_index { "" } else { "," })?;
             }
         }
 
@@ -1189,12 +1192,16 @@ impl fmt::Display for Class {
             };
 
             if member_access.is_none() && prev_access.is_none() {
+                for _ in 0..=self.depth {
+                    write!(f, "    ")?;
+                }
+
                 writeln!(f, "public:")?;
                 prev_access = Some("public");
             }
             else if member_access != prev_access {
                 if let Some(member_access) = member_access {
-                    for _ in 0..self.depth {
+                    for _ in 0..=self.depth {
                         write!(f, "    ")?;
                     }
             
@@ -1204,7 +1211,7 @@ impl fmt::Display for Class {
                 prev_access = member_access;
             }
 
-            for _ in 0..self.depth {
+            for _ in 0..(self.member_indent_level() - 1) {
                 write!(f, "    ")?;
             }
 
@@ -1214,7 +1221,7 @@ impl fmt::Display for Class {
             match member {
                 ClassMember::Field(_) => {
                     let rendered = format!("{}", member);
-                    let indent = "    ".repeat(self.depth as usize + 1);
+                    let indent = "    ".repeat(self.member_indent_level() as usize);
                     for (i, line) in rendered.split('\n').enumerate() {
                         if i == 0 {
                             writeln!(f, "    {}", line)?;
