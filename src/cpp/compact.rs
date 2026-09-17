@@ -1,4 +1,4 @@
-//! Writing standard-library types the way a person would, not the way a PDB does.
+//! Writing standard- and rapidjson-library types the way a person would, not the way a PDB does.
 //!
 //! A PDB records a type fully instantiated. `std::vector<std::string>` comes
 //! back as `std::vector<std::string,std::allocator<std::string> >`, an
@@ -100,6 +100,29 @@ const DEFAULTS: &[(&str, usize, &[Default])] = &[
     // This one is 32-bit because the target is.
     ("span", 1, &[Default::Literal("4294967295")]),
     ("ratio", 1, &[Default::Literal("1")]),
+    // rapidjson. `Generic*` templates spell out their encoding and allocator,
+    // and the writers spell out the default encodings, allocator and write
+    // flags; dropping those leaves `alias_for` a name to reduce.
+    ("PrettyWriter", 1, &[
+        Default::Literal("rapidjson::UTF8<char>"),
+        Default::Literal("rapidjson::UTF8<char>"),
+        Default::Literal("rapidjson::CrtAllocator"),
+        Default::Literal("0"),
+    ]),
+    ("Writer", 1, &[
+        Default::Literal("rapidjson::UTF8<char>"),
+        Default::Literal("rapidjson::UTF8<char>"),
+        Default::Literal("rapidjson::CrtAllocator"),
+        Default::Literal("0"),
+    ]),
+    ("GenericStringBuffer", 1, &[Default::Literal("rapidjson::CrtAllocator")]),
+    ("GenericDocument", 1, &[
+        Default::Literal("rapidjson::MemoryPoolAllocator<rapidjson::CrtAllocator>"),
+        Default::Literal("rapidjson::CrtAllocator"),
+    ]),
+    ("GenericValue", 1, &[
+        Default::Literal("rapidjson::MemoryPoolAllocator<rapidjson::CrtAllocator>"),
+    ]),
 ];
 
 /// The `basic_` templates that have a name of their own once reduced to one
@@ -112,17 +135,31 @@ const ALIAS_STEMS: &[&str] = &[
 ];
 
 fn alias_for(name: &str, argument: &str) -> Option<String> {
-    let stem = name.strip_prefix("basic_")?;
-    let known = ALIAS_STEMS.contains(&stem) || stem == "regex";
-    if !known {
-        return None;
+    // `std::basic_string<char>` is spelled `std::string` by everyone.
+    if let Some(stem) = name.strip_prefix("basic_") {
+        if !(ALIAS_STEMS.contains(&stem) || stem == "regex") {
+            return None;
+        }
+        return match argument {
+            "char" => Some(format!("std::{stem}")),
+            "wchar_t" => Some(format!("std::w{stem}")),
+            _ => None,
+        };
     }
-    let stem = if stem == "regex" { "regex" } else { stem };
-    match argument {
-        "char" => Some(format!("std::{stem}")),
-        "wchar_t" => Some(format!("std::w{stem}")),
-        _ => None,
+    // `rapidjson::GenericStringBuffer<UTF8<char>>` is `rapidjson::StringBuffer`,
+    // and the same applies to `GenericDocument` and `GenericValue`.
+    if let Some(short) = name.strip_prefix("Generic") {
+        if !matches!(short, "StringBuffer" | "Document" | "Value") {
+            return None;
+        }
+        return (argument == "rapidjson::UTF8<char>")
+            .then(|| format!("rapidjson::{short}"));
     }
+    // `PrettyWriter` is just `Writer` with indentation; write it as `Writer`.
+    if name == "PrettyWriter" {
+        return Some(format!("rapidjson::Writer<{argument}>"));
+    }
+    None
 }
 
 fn defaults_for(name: &str) -> Option<(usize, &'static [Default])> {
@@ -187,30 +224,43 @@ fn expected(default: &Default, leading: &[&str]) -> String {
     }
 }
 
-/// Where a `std::<known template><` starts at or after `from`, and its name.
+/// Where a known standard- or rapidjson-library template starts at or after
+/// `from`, and its name.
 fn next_template(text: &str, from: usize) -> Option<(usize, usize, &'static str)> {
+    const NAMESPACES: &[&str] = &["std::", "rapidjson::"];
+
     let bytes = text.as_bytes();
-    let mut at = from;
-    while let Some(found) = text[at..].find("std::") {
-        let start = at + found;
-        // A qualified name reaching further left is not ours to touch.
-        let preceded = start > 0 && {
-            let b = bytes[start - 1];
-            b.is_ascii_alphanumeric() || b == b'_' || b == b':'
-        };
-        let rest = &text[start + 5..];
-        let end = rest
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .unwrap_or(rest.len());
-        if !preceded && rest.as_bytes().get(end) == Some(&b'<') {
-            let name = &rest[..end];
-            if let Some((known, _, _)) = DEFAULTS.iter().find(|(n, _, _)| *n == name) {
-                return Some((start, start + 5 + end, known));
+    // A rapidjson template can nest inside a std one (and vice versa), so take
+    // the leftmost match across every namespace rather than stopping at the
+    // first namespace that has any match at all.
+    let mut earliest: Option<(usize, usize, &'static str)> = None;
+    for namespace in NAMESPACES {
+        let mut at = from;
+        while let Some(found) = text[at..].find(namespace) {
+            let start = at + found;
+            // A qualified name reaching further left is not ours to touch.
+            let preceded = start > 0 && {
+                let b = bytes[start - 1];
+                b.is_ascii_alphanumeric() || b == b'_' || b == b':'
+            };
+            let rest = &text[start + namespace.len()..];
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            if !preceded && rest.as_bytes().get(end) == Some(&b'<') {
+                let name = &rest[..end];
+                if let Some((known, _, _)) = DEFAULTS.iter().find(|(n, _, _)| *n == name) {
+                    let candidate = (start, start + namespace.len() + end, *known);
+                    if earliest.is_none_or(|(e, _, _)| start < e) {
+                        earliest = Some(candidate);
+                    }
+                    break;
+                }
             }
+            at = start + namespace.len();
         }
-        at = start + 5;
     }
-    None
+    earliest
 }
 
 /// Rewrite every standard-library template in `text` without the arguments that
@@ -308,6 +358,44 @@ mod tests {
         assert_eq!(
             compact("std::basic_ifstream<char,std::char_traits<char> >"),
             "std::ifstream"
+        );
+    }
+
+    #[test]
+    fn compacts_rapidjson_types() {
+        assert_eq!(
+            compact(
+                "rapidjson::PrettyWriter<rapidjson::GenericStringBuffer<rapidjson::UTF8<char>,\
+                 rapidjson::CrtAllocator>,rapidjson::UTF8<char>,rapidjson::UTF8<char>,\
+                 rapidjson::CrtAllocator,0>"
+            ),
+            "rapidjson::Writer<rapidjson::StringBuffer>"
+        );
+        assert_eq!(
+            compact(
+                "rapidjson::Writer<rapidjson::GenericStringBuffer<rapidjson::UTF8<char>,\
+                 rapidjson::CrtAllocator>,rapidjson::UTF8<char>,rapidjson::UTF8<char>,\
+                 rapidjson::CrtAllocator,0>"
+            ),
+            "rapidjson::Writer<rapidjson::StringBuffer>"
+        );
+        assert_eq!(
+            compact("rapidjson::GenericStringBuffer<rapidjson::UTF8<char>,rapidjson::CrtAllocator>"),
+            "rapidjson::StringBuffer"
+        );
+        assert_eq!(
+            compact(
+                "rapidjson::GenericDocument<rapidjson::UTF8<char>,\
+                 rapidjson::MemoryPoolAllocator<rapidjson::CrtAllocator>,rapidjson::CrtAllocator>"
+            ),
+            "rapidjson::Document"
+        );
+        assert_eq!(
+            compact(
+                "rapidjson::GenericValue<rapidjson::UTF8<char>,\
+                 rapidjson::MemoryPoolAllocator<rapidjson::CrtAllocator> >"
+            ),
+            "rapidjson::Value"
         );
     }
 

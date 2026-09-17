@@ -425,6 +425,211 @@ fn find_enum_or_flags_typedef<'a>(
     None
 }
 
+/// Extracts the trailing identifier (the variable name) from a rendered C++
+/// declaration. The name is the final whitespace-separated token with any leading
+/// `*`/`&` pointer/reference decorator stripped.
+///
+/// e.g. `s_model_variant &variant` -> `variant`,
+///      `Server::Voting::AbstractVotingSystem *elem` -> `elem`,
+///      `unsigned __int32 result` -> `result`.
+fn variable_identifier(signature: &str) -> String {
+    signature
+        .trim_end()
+        .rsplit(' ')
+        .next()
+        .unwrap_or("")
+        .trim_start_matches(['*', '&'])
+        .to_string()
+}
+
+/// Returns the declaration's type by stripping the trailing variable name token.
+///
+/// e.g. `std::vector<int> values` -> `std::vector<int>`,
+///      `unsigned __int32 i` -> `unsigned __int32`,
+///      `s_model_variant &variant` -> `s_model_variant`.
+fn declaration_type(signature: &str) -> String {
+    let trimmed = signature.trim();
+    match trimmed.rfind(' ') {
+        Some(pos) => trimmed[..pos].trim_end().to_string(),
+        None => String::new(),
+    }
+}
+
+/// Recognizes the temporaries MSVC emits for a range-based `for` loop:
+/// `<range>$L0`, `<begin>$L0` and `<end>$L0`. Returns `(marker, scope_suffix)`
+/// where `marker` is one of `range`/`begin`/`end` and `scope_suffix` is the
+/// `$L<digits>` portion shared by all three declarations (used to match them up
+/// when several loops live in one function).
+fn iterator_marker(name: &str) -> Option<(&'static str, &str)> {
+    for marker in ["range", "begin", "end"] {
+        let prefix = format!("<{marker}>");
+        if let Some(suffix) = name.strip_prefix(prefix.as_str()) {
+            return Some((marker, suffix));
+        }
+    }
+    None
+}
+
+/// Builds a `type -> name` map for the module's global/static variables so a
+/// range-for's collection can be resolved back to the variable it iterates.
+fn collect_global_names(module: &cpp::Module) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+
+    for member in &module.members {
+        let (name, signature) = match member {
+            cpp::ModuleMember::Data { name, signature, .. }
+            | cpp::ModuleMember::ThreadStorage { name, signature, .. } => (name, signature),
+            _ => continue,
+        };
+
+        // Signatures carry a trailing `"; // 0x..."` address comment.
+        let declaration = signature.split(';').next().unwrap_or(signature).trim();
+        let ty = declaration_type(declaration);
+        if !ty.is_empty() {
+            map.insert(ty, name.clone());
+        }
+    }
+
+    map
+}
+
+/// Builds a `type -> name` map for the local variables declared in a function
+/// body. Used as a fallback when a range-for's collection is a local rather than
+/// a global.
+fn collect_local_names(block: &cpp::Block, map: &mut HashMap<String, String>) {
+    for statement in &block.statements {
+        match statement {
+            cpp::Statement::Variable(variable) => {
+                let ty = declaration_type(&variable.signature);
+                if !ty.is_empty() {
+                    map.entry(ty).or_insert_with(|| variable_identifier(&variable.signature));
+                }
+            }
+            cpp::Statement::Block(child) => collect_local_names(child, map),
+            _ => {}
+        }
+    }
+}
+
+/// Detects a collapsed range-based `for` loop at the start of `statements` and,
+/// when found, returns the loop's comment line and its (still populated) body.
+///
+/// The pattern is the three MSVC temporaries — `<range>`, `<begin>`, `<end>` —
+/// appearing in any order, followed by a nested block whose first declaration is
+/// the loop variable.
+fn detect_range_for(
+    statements: &[cpp::Statement],
+    names: &HashMap<String, String>,
+) -> Option<(String, cpp::Block)> {
+    if statements.len() < 4 {
+        return None;
+    }
+
+    let mut range_scope: Option<String> = None;
+    let mut begin_scope: Option<String> = None;
+    let mut end_scope: Option<String> = None;
+    let mut collection_type: Option<String> = None;
+    let mut seen = std::collections::HashSet::new();
+
+    for statement in statements.iter().take(3) {
+        let cpp::Statement::Variable(variable) = statement else {
+            return None;
+        };
+
+        let name = variable_identifier(&variable.signature);
+        let Some((marker, scope)) = iterator_marker(&name) else {
+            return None;
+        };
+
+        if !seen.insert(marker) {
+            return None;
+        }
+
+        match marker {
+            "range" => {
+                range_scope = Some(scope.to_string());
+
+                // The range is a reference to the collection (`Type &<range>$L0`);
+                // strip the reference and name to recover the collection's type.
+                let suffix = format!("&{name}");
+                collection_type = Some(
+                    variable
+                        .signature
+                        .trim_end()
+                        .strip_suffix(&suffix)
+                        .unwrap_or(variable.signature.trim_end())
+                        .trim_end()
+                        .to_string(),
+                );
+            }
+            "begin" => begin_scope = Some(scope.to_string()),
+            "end" => end_scope = Some(scope.to_string()),
+            _ => unreachable!(),
+        }
+    }
+
+    let range_scope = range_scope?;
+    if range_scope != begin_scope? || range_scope != end_scope? {
+        return None;
+    }
+
+    let collection_type = collection_type?;
+
+    let cpp::Statement::Block(body) = &statements[3] else {
+        return None;
+    };
+
+    // The loop variable is the first declaration in the body scope.
+    let element = match body.statements.first() {
+        Some(cpp::Statement::Variable(variable)) => variable_identifier(&variable.signature),
+        _ => return None,
+    };
+
+    // Drop the loop variable from the body (it is now the `for` header).
+    let mut new_body = body.clone();
+    new_body.statements.remove(0);
+
+    let collection = names
+        .get(&collection_type)
+        .cloned()
+        .unwrap_or_else(|| "collection".to_string());
+
+    Some((format!("for (auto {element} : {collection})"), new_body))
+}
+
+/// Recursively collapses range-based `for` loop scopes into a single
+/// `// for (auto element : collection)` comment followed by the loop body.
+///
+/// MSVC wraps each loop in a scope block whose contents are the three
+/// temporaries (`<range>`, `<begin>`, `<end>`) followed by the loop body block.
+/// That scope block is flattened away, leaving the comment and body as siblings.
+fn transform_iterator_loops(statements: &mut Vec<cpp::Statement>, names: &HashMap<String, String>) {
+    // Recurse into nested blocks first so inner loops collapse before outer ones.
+    for statement in statements.iter_mut() {
+        if let cpp::Statement::Block(child) = statement {
+            transform_iterator_loops(&mut child.statements, names);
+        }
+    }
+
+    let mut i = 0;
+    while i < statements.len() {
+        if let cpp::Statement::Block(child) = &statements[i]
+            && let Some((comment, body)) = detect_range_for(&child.statements, names)
+        {
+            statements.splice(
+                i..=i,
+                [
+                    cpp::Statement::Comment(comment),
+                    cpp::Statement::Block(body),
+                ],
+            );
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+}
+
 #[inline(always)]
 pub fn reorganize_module_members(
     type_finder: &pdb2::TypeFinder,
@@ -802,6 +1007,10 @@ pub fn reorganize_module_members(
         }
     }
 
+    // Map used to resolve a range-for's collection back to a named variable (a
+    // global/static first, a function-local second, `collection` as a fallback).
+    let global_names = collect_global_names(module);
+
     let mut new_public_code_members: Vec<cpp::ModuleMember> = vec![];
 
     for member in public_code_members.iter() {
@@ -836,6 +1045,14 @@ pub fn reorganize_module_members(
             );
         }
         
+        let mut names = global_names.clone();
+        if let Some(body) = procedure.body.as_ref() {
+            collect_local_names(body, &mut names);
+        }
+        if let Some(body) = procedure.body.as_mut() {
+            transform_iterator_loops(&mut body.statements, &names);
+        }
+
         comment_block(procedure.body.as_mut().unwrap());
 
         if let Some((mangled_name, _address)) = module.mangled_symbols.iter()
@@ -917,6 +1134,14 @@ pub fn reorganize_module_members(
             );
         }
         
+        let mut names = global_names.clone();
+        if let Some(body) = procedure.body.as_ref() {
+            collect_local_names(body, &mut names);
+        }
+        if let Some(body) = procedure.body.as_mut() {
+            transform_iterator_loops(&mut body.statements, &names);
+        }
+
         comment_block(procedure.body.as_mut().unwrap());
 
         if procedure.body.is_none() {
@@ -985,4 +1210,183 @@ pub fn reorganize_module_members(
     module.members = new_members;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn var(signature: &str) -> cpp::Statement {
+        cpp::Statement::Variable(cpp::Variable {
+            signature: signature.to_string(),
+            value: None,
+            comment: None,
+        })
+    }
+
+    fn block(statements: Vec<cpp::Statement>) -> cpp::Statement {
+        cpp::Statement::Block(cpp::Block {
+            address: None,
+            statements,
+        })
+    }
+
+    #[test]
+    fn collapses_range_for_with_global_collection() {
+        // Mirrors `for (auto elem : VotingSystems)` over
+        // `extern std::vector<AbstractVotingSystem *> VotingSystems`.
+        let mut statements = vec![
+            var("s_model_definition *model_definition"),
+            var("long variant_count"),
+            block(vec![
+                var("std::vector<Server::Voting::AbstractVotingSystem *> &<range>$L0"),
+                var("Server::Voting::AbstractVotingSystem **<begin>$L0"),
+                var("Server::Voting::AbstractVotingSystem **<end>$L0"),
+                block(vec![var("Server::Voting::AbstractVotingSystem *elem")]),
+            ]),
+        ];
+
+        let mut names = HashMap::new();
+        names.insert(
+            "std::vector<Server::Voting::AbstractVotingSystem *>".to_string(),
+            "VotingSystems".to_string(),
+        );
+
+        transform_iterator_loops(&mut statements, &names);
+
+        assert_eq!(statements.len(), 4);
+        assert!(matches!(statements[0], cpp::Statement::Variable(_)));
+        assert!(matches!(statements[1], cpp::Statement::Variable(_)));
+        assert_eq!(
+            statements[2],
+            cpp::Statement::Comment("for (auto elem : VotingSystems)".to_string())
+        );
+        assert_eq!(statements[3], block(vec![]));
+    }
+
+    #[test]
+    fn falls_back_to_collection_when_unnamed() {
+        let mut statements = vec![block(vec![
+            var("c_tag_block<s_model_variant> &<range>$L0"),
+            var("s_model_variant *<begin>$L0"),
+            var("s_model_variant *<end>$L0"),
+            block(vec![var("s_model_variant &variant")]),
+        ])];
+
+        transform_iterator_loops(&mut statements, &HashMap::new());
+
+        assert_eq!(statements.len(), 2);
+        assert_eq!(
+            statements[0],
+            cpp::Statement::Comment("for (auto variant : collection)".to_string())
+        );
+        assert_eq!(statements[1], block(vec![]));
+    }
+
+    #[test]
+    fn resolves_local_collection_name() {
+        let body = cpp::Block {
+            address: None,
+            statements: vec![
+                // A local collection followed by the loop itself.
+                var("std::vector<int> values"),
+                block(vec![
+                    var("std::vector<int> &<range>$L0"),
+                    var("int *<begin>$L0"),
+                    var("int *<end>$L0"),
+                    block(vec![var("int value")]),
+                ]),
+            ],
+        };
+
+        let mut names = HashMap::new();
+        collect_local_names(&body, &mut names);
+
+        let mut statements = body.statements;
+        transform_iterator_loops(&mut statements, &names);
+
+        assert_eq!(statements.len(), 3);
+        assert!(matches!(statements[0], cpp::Statement::Variable(_)));
+        assert_eq!(
+            statements[1],
+            cpp::Statement::Comment("for (auto value : values)".to_string())
+        );
+        assert_eq!(statements[2], block(vec![]));
+    }
+
+    #[test]
+    fn handles_reordered_range_begin_end() {
+        // The three temporaries may appear in any order due to register allocation.
+        let mut statements = vec![block(vec![
+            var("int *<end>$L0"),
+            var("std::vector<int> &<range>$L0"),
+            var("int *<begin>$L0"),
+            block(vec![var("int item")]),
+        ])];
+
+        let mut names = HashMap::new();
+        names.insert("std::vector<int>".to_string(), "items".to_string());
+
+        transform_iterator_loops(&mut statements, &names);
+
+        assert_eq!(statements.len(), 2);
+        assert_eq!(
+            statements[0],
+            cpp::Statement::Comment("for (auto item : items)".to_string())
+        );
+    }
+
+    #[test]
+    fn leaves_incomplete_pattern_untouched() {
+        // Only two of the three temporaries — not a range-for.
+        let original = vec![block(vec![
+            var("std::vector<int> &<range>$L0"),
+            var("int *<begin>$L0"),
+            block(vec![var("int item")]),
+        ])];
+
+        let mut statements = original.clone();
+        transform_iterator_loops(&mut statements, &HashMap::new());
+
+        assert_eq!(statements, original);
+    }
+
+    #[test]
+    fn collapses_nested_range_fors() {
+        // The inner loop lives inside the outer loop's body, after the outer
+        // loop variable.
+        let mut statements = vec![block(vec![
+            var("std::vector<int> &<range>$L0"),
+            var("int *<begin>$L0"),
+            var("int *<end>$L0"),
+            block(vec![
+                var("int &outer"),
+                block(vec![
+                    var("std::vector<float> &<range>$L1"),
+                    var("float *<begin>$L1"),
+                    var("float *<end>$L1"),
+                    block(vec![var("float &inner")]),
+                ]),
+            ]),
+        ])];
+
+        let mut names = HashMap::new();
+        names.insert("std::vector<int>".to_string(), "outers".to_string());
+        names.insert("std::vector<float>".to_string(), "inners".to_string());
+
+        transform_iterator_loops(&mut statements, &names);
+
+        assert_eq!(statements.len(), 2);
+        assert_eq!(
+            statements[0],
+            cpp::Statement::Comment("for (auto outer : outers)".to_string())
+        );
+        assert_eq!(
+            statements[1],
+            block(vec![
+                cpp::Statement::Comment("for (auto inner : inners)".to_string()),
+                block(vec![]),
+            ])
+        );
+    }
 }
