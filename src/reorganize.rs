@@ -514,8 +514,30 @@ fn iterator_marker(signature: &str) -> Option<(&'static str, String, String)> {
     None
 }
 
-/// Builds a `type -> name` map for the module's global/static variables so a
-/// range-for's collection can be resolved back to the variable it iterates.
+/// Returns true if `name` is a MSVC scope temporary (`$S<N>`), the lifetime
+/// extended storage the compiler materializes when a loop iterates over a
+/// temporary collection.
+fn is_scope_temp(name: &str) -> bool {
+    name.strip_prefix("$S")
+        .map(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or(false)
+}
+
+/// Chooses the collection's length accessor for a C-style `for` loop based on the
+/// collection type: std containers use `.size()`, rapidjson uses `.Size()`, and
+/// Bungie/Halo tag blocks expose a `.count` field.
+fn size_accessor(collection_type: &str) -> &'static str {
+    if collection_type.starts_with("std::") {
+        ".size()"
+    } else if collection_type.contains("rapidjson") {
+        ".Size()"
+    } else {
+        ".count"
+    }
+}
+
+/// Builds a `type -> name` map for the module's global/static variables so that
+/// a range-for's collection can be resolved back to the variable it iterates.
 fn collect_global_names(module: &cpp::Module) -> HashMap<String, String> {
     let mut map = HashMap::new();
 
@@ -553,9 +575,16 @@ fn collect_local_names(block: &cpp::Block, map: &mut HashMap<String, String>) {
                     continue;
                 }
 
+                let name = variable_identifier(&variable.signature);
+                // Scope temporaries (`$S<N>`) are lifetime-extended copies of a
+                // temporary collection; their names are meaningless too.
+                if is_scope_temp(&name) {
+                    continue;
+                }
+
                 let ty = declaration_type(&variable.signature);
                 if !ty.is_empty() {
-                    map.entry(ty).or_insert_with(|| variable_identifier(&variable.signature));
+                    map.entry(ty).or_insert_with(|| name);
                 }
             }
             cpp::Statement::Block(child) => collect_local_names(child, map),
@@ -564,89 +593,106 @@ fn collect_local_names(block: &cpp::Block, map: &mut HashMap<String, String>) {
     }
 }
 
-/// Detects a collapsed range-based `for` loop at the start of `statements` and,
-/// when found, returns the loop's comment line and its (still populated) body.
+/// Detects a collapsed `for` loop at the start of `statements` and, when found,
+/// returns the loop's comment line and its (still populated) body.
 ///
-/// The pattern is the three MSVC temporaries — `<range>`, `<begin>`, `<end>` —
-/// appearing in any order, followed by a nested block whose first declaration is
-/// the loop variable.
+/// A loop scope contains the three MSVC temporaries — `<range>`, `<begin>`,
+/// `<end>` — and, when iterating a temporary collection, a `$S<N>` scope
+/// temporary. All of these may appear in any order (register allocation), followed
+/// by a nested block that is the loop body.
 fn detect_range_for(
     statements: &[cpp::Statement],
     names: &HashMap<String, String>,
 ) -> Option<(String, cpp::Block)> {
-    if statements.len() < 4 {
-        return None;
-    }
-
     let mut range_scope: Option<String> = None;
     let mut begin_scope: Option<String> = None;
     let mut end_scope: Option<String> = None;
     let mut collection_type: Option<String> = None;
+    let mut has_scope_temp = false;
     let mut seen = std::collections::HashSet::new();
 
-    for statement in statements.iter().take(3) {
-        let cpp::Statement::Variable(variable) = statement else {
-            return None;
-        };
-
-        let Some((marker, scope, full_name)) = iterator_marker(&variable.signature) else {
-            return None;
-        };
-
-        if !seen.insert(marker) {
-            return None;
-        }
-
-        match marker {
-            "range" => {
-                range_scope = Some(scope);
-
-                // The range is a reference to the collection (`Type &<range>$L0`);
-                // strip the reference and name to recover the collection's type.
-                let suffix = format!("&{full_name}");
-                collection_type = Some(
-                    variable
-                        .signature
-                        .trim_end()
-                        .strip_suffix(&suffix)
-                        .unwrap_or(variable.signature.trim_end())
-                        .trim_end()
-                        .to_string(),
-                );
+    // Consume the leading declarations (iterator temporaries and, optionally, a
+    // `$S<N>` scope temporary) until the loop body block.
+    let mut index = 0;
+    while let Some(cpp::Statement::Variable(variable)) = statements.get(index) {
+        if let Some((marker, scope, full_name)) = iterator_marker(&variable.signature) {
+            if !seen.insert(marker) {
+                return None;
             }
-            "begin" => begin_scope = Some(scope),
-            "end" => end_scope = Some(scope),
-            _ => unreachable!(),
+
+            match marker {
+                "range" => {
+                    range_scope = Some(scope);
+
+                    // The range is a reference to the collection; strip the
+                    // reference and name to recover the collection's type.
+                    let suffix = format!("&{full_name}");
+                    collection_type = Some(
+                        variable
+                            .signature
+                            .trim_end()
+                            .strip_suffix(&suffix)
+                            .unwrap_or(variable.signature.trim_end())
+                            .trim_end()
+                            .to_string(),
+                    );
+                }
+                "begin" => begin_scope = Some(scope),
+                "end" => end_scope = Some(scope),
+                _ => unreachable!(),
+            }
+        } else if is_scope_temp(&variable_identifier(&variable.signature)) {
+            if has_scope_temp {
+                return None;
+            }
+            has_scope_temp = true;
+        } else {
+            // An unrelated declaration — not a loop scope.
+            return None;
         }
+
+        index += 1;
     }
 
+    let cpp::Statement::Block(body) = statements.get(index)? else {
+        return None;
+    };
+
+    // All three temporaries must be present and share a scope.
     let range_scope = range_scope?;
-    if range_scope != begin_scope? || range_scope != end_scope? {
+    let begin_scope = begin_scope?;
+    let end_scope = end_scope?;
+    if range_scope != begin_scope || range_scope != end_scope {
         return None;
     }
 
     let collection_type = collection_type?;
-
-    let cpp::Statement::Block(body) = &statements[3] else {
-        return None;
-    };
-
-    // The loop variable is the first declaration in the body scope.
-    let element = match body.statements.first() {
-        Some(cpp::Statement::Variable(variable)) => variable_identifier(&variable.signature),
-        _ => return None,
-    };
-
-    // Drop the loop variable from the body (it is now the `for` header).
-    let mut new_body = body.clone();
-    new_body.statements.remove(0);
-
     let collection = names
         .get(&collection_type)
         .cloned()
         .unwrap_or_else(|| "collection".to_string());
 
-    Some((format!("for (auto {element} : {collection})"), new_body))
+    if has_scope_temp {
+        // A C-style index loop: the body's first declaration (`collection[i]`)
+        // stays in the body; the loop variable is the index, not that element.
+        let accessor = size_accessor(&collection_type);
+        Some((
+            format!("for (int i = 0; i < {collection}{accessor}; i++)"),
+            body.clone(),
+        ))
+    } else {
+        // A range-for: the loop variable is the first declaration in the body scope.
+        let element = match body.statements.first() {
+            Some(cpp::Statement::Variable(variable)) => variable_identifier(&variable.signature),
+            _ => return None,
+        };
+
+        // Drop the loop variable from the body (it is now the `for` header).
+        let mut new_body = body.clone();
+        new_body.statements.remove(0);
+
+        Some((format!("for (auto {element} : {collection})"), new_body))
+    }
 }
 
 /// Recursively collapses range-based `for` loop scopes into a single
@@ -1455,6 +1501,78 @@ mod tests {
         assert_eq!(
             statements[0],
             cpp::Statement::Comment("for (auto arg : collection)".to_string())
+        );
+    }
+
+    #[test]
+    fn infers_collection_size_accessor() {
+        assert_eq!(size_accessor("std::vector<int>"), ".size()");
+        assert_eq!(
+            size_accessor("rapidjson::GenericArray<0,rapidjson::Value>"),
+            ".Size()"
+        );
+        assert_eq!(size_accessor("c_tag_block<s_model_variant>"), ".count");
+    }
+
+    #[test]
+    fn collapses_c_style_for_loop() {
+        // A temporary collection (`$S9`) collapses to a C-style index loop whose
+        // body keeps its `collection[i]` element declaration.
+        let mut statements = vec![block(vec![
+            var("rapidjson::GenericArray<0,rapidjson::Value> &<range>$L0"),
+            var("rapidjson::Value *<begin>$L0"),
+            var("rapidjson::Value *<end>$L0"),
+            var("rapidjson::GenericArray<0,rapidjson::Value> $S9"),
+            block(vec![
+                var("rapidjson::Value const &mapObject"),
+                block(vec![var("Server::Voting::HaloMap haloMap")]),
+            ]),
+        ])];
+
+        transform_iterator_loops(&mut statements, &HashMap::new());
+
+        assert_eq!(statements.len(), 2);
+        assert_eq!(
+            statements[0],
+            cpp::Statement::Comment("for (int i = 0; i < collection.Size(); i++)".to_string())
+        );
+        assert_eq!(
+            statements[1],
+            block(vec![
+                var("rapidjson::Value const &mapObject"),
+                block(vec![var("Server::Voting::HaloMap haloMap")]),
+            ])
+        );
+    }
+
+    #[test]
+    fn handles_reordered_scope_temporary() {
+        // The `$S<N>` temporary and the three iterators can appear in any order.
+        // (Mirrors LoadVotingJson: `$S10`, `end`, `begin`, `range`.)
+        let mut statements = vec![block(vec![
+            var("rapidjson::GenericArray<0,rapidjson::Value> $S10"),
+            var("rapidjson::Value *<end>$L1"),
+            var("rapidjson::Value *<begin>$L1"),
+            var("rapidjson::GenericArray<0,rapidjson::Value> &<range>$L1"),
+            block(vec![
+                var("rapidjson::Value const &typeObject"),
+                block(vec![var("Server::Voting::HaloType ht")]),
+            ]),
+        ])];
+
+        transform_iterator_loops(&mut statements, &HashMap::new());
+
+        assert_eq!(statements.len(), 2);
+        assert_eq!(
+            statements[0],
+            cpp::Statement::Comment("for (int i = 0; i < collection.Size(); i++)".to_string())
+        );
+        assert_eq!(
+            statements[1],
+            block(vec![
+                var("rapidjson::Value const &typeObject"),
+                block(vec![var("Server::Voting::HaloType ht")]),
+            ])
         );
     }
 
