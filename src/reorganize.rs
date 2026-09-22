@@ -425,21 +425,49 @@ fn find_enum_or_flags_typedef<'a>(
     None
 }
 
-/// Extracts the trailing identifier (the variable name) from a rendered C++
-/// declaration. The name is the final whitespace-separated token with any leading
-/// `*`/`&` pointer/reference decorator stripped.
+/// Extracts the variable name from a rendered C++ declaration.
+///
+/// The name is the rightmost identifier-like run of characters, handling simple
+/// declarations as well as pointers/references and function-pointer declarators:
 ///
 /// e.g. `s_model_variant &variant` -> `variant`,
 ///      `Server::Voting::AbstractVotingSystem *elem` -> `elem`,
-///      `unsigned __int32 result` -> `result`.
+///      `unsigned __int32 result` -> `result`,
+///      `void (*&handler)()` -> `handler`,
+///      `char buffer[8192]` -> `buffer`.
 fn variable_identifier(signature: &str) -> String {
-    signature
-        .trim_end()
-        .rsplit(' ')
-        .next()
-        .unwrap_or("")
-        .trim_start_matches(['*', '&'])
-        .to_string()
+    fn is_start(c: char) -> bool {
+        c.is_alphabetic() || c == '_' || c == '$' || c == '<'
+    }
+    fn is_continue(c: char) -> bool {
+        c.is_alphanumeric() || c == '_' || c == '$' || c == '<' || c == '>'
+    }
+
+    let chars: Vec<char> = signature.trim_end().chars().collect();
+    let mut i = chars.len();
+
+    while i > 0 {
+        if !is_continue(chars[i - 1]) {
+            i -= 1;
+            continue;
+        }
+
+        // Walk back to the start of this run of name-continue characters.
+        let mut start = i - 1;
+        while start > 0 && is_continue(chars[start - 1]) {
+            start -= 1;
+        }
+
+        // The run is only a valid name if it begins with a name-start character
+        // (this skips pure numbers such as an array size).
+        if is_start(chars[start]) {
+            return chars[start..i].iter().collect();
+        }
+
+        i = start;
+    }
+
+    String::new()
 }
 
 /// Returns the declaration's type by stripping the trailing variable name token.
@@ -456,15 +484,31 @@ fn declaration_type(signature: &str) -> String {
 }
 
 /// Recognizes the temporaries MSVC emits for a range-based `for` loop:
-/// `<range>$L0`, `<begin>$L0` and `<end>$L0`. Returns `(marker, scope_suffix)`
-/// where `marker` is one of `range`/`begin`/`end` and `scope_suffix` is the
-/// `$L<digits>` portion shared by all three declarations (used to match them up
-/// when several loops live in one function).
-fn iterator_marker(name: &str) -> Option<(&'static str, &str)> {
+/// `<range>$L0`, `<begin>$L0` and `<end>$L0`. The marker is searched for in the
+/// full signature (named iterator temporaries can otherwise be embedded in a
+/// function-pointer declarator such as `void (**<begin>$L0)()`).
+///
+/// Returns `(marker, scope, full_name)` where `marker` is one of
+/// `range`/`begin`/`end`, `scope` is the `$L<digits>` portion shared by all three
+/// declarations (used to match them up when several loops live in one function),
+/// and `full_name` is the whole matched temporary name (e.g. `<range>$L0`).
+fn iterator_marker(signature: &str) -> Option<(&'static str, String, String)> {
     for marker in ["range", "begin", "end"] {
-        let prefix = format!("<{marker}>");
-        if let Some(suffix) = name.strip_prefix(prefix.as_str()) {
-            return Some((marker, suffix));
+        let tag = format!("<{marker}>");
+        if let Some(pos) = signature.find(&tag) {
+            let after = &signature[pos + tag.len()..];
+            let scope = after
+                .strip_prefix("$L")
+                .map(|rest| {
+                    let digits: String = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect();
+                    format!("$L{digits}")
+                })
+                .unwrap_or_default();
+            let full_name = format!("{tag}{scope}");
+            return Some((marker, scope, full_name));
         }
     }
     None
@@ -500,6 +544,15 @@ fn collect_local_names(block: &cpp::Block, map: &mut HashMap<String, String>) {
     for statement in &block.statements {
         match statement {
             cpp::Statement::Variable(variable) => {
+                // Range-for temporaries (`<range>$L0`, `<begin>$L0`, `<end>$L0`)
+                // share the collection's type via a reference; their compiler
+                // generated names are meaningless, so skip them rather than let
+                // them shadow the real collection name (or the `collection`
+                // fallback).
+                if iterator_marker(&variable.signature).is_some() {
+                    continue;
+                }
+
                 let ty = declaration_type(&variable.signature);
                 if !ty.is_empty() {
                     map.entry(ty).or_insert_with(|| variable_identifier(&variable.signature));
@@ -536,8 +589,7 @@ fn detect_range_for(
             return None;
         };
 
-        let name = variable_identifier(&variable.signature);
-        let Some((marker, scope)) = iterator_marker(&name) else {
+        let Some((marker, scope, full_name)) = iterator_marker(&variable.signature) else {
             return None;
         };
 
@@ -547,11 +599,11 @@ fn detect_range_for(
 
         match marker {
             "range" => {
-                range_scope = Some(scope.to_string());
+                range_scope = Some(scope);
 
                 // The range is a reference to the collection (`Type &<range>$L0`);
                 // strip the reference and name to recover the collection's type.
-                let suffix = format!("&{name}");
+                let suffix = format!("&{full_name}");
                 collection_type = Some(
                     variable
                         .signature
@@ -562,8 +614,8 @@ fn detect_range_for(
                         .to_string(),
                 );
             }
-            "begin" => begin_scope = Some(scope.to_string()),
-            "end" => end_scope = Some(scope.to_string()),
+            "begin" => begin_scope = Some(scope),
+            "end" => end_scope = Some(scope),
             _ => unreachable!(),
         }
     }
@@ -1349,6 +1401,61 @@ mod tests {
         transform_iterator_loops(&mut statements, &HashMap::new());
 
         assert_eq!(statements, original);
+    }
+
+    #[test]
+    fn collapses_range_for_over_function_pointers() {
+        // Mirrors `for (auto&& handler : defaultHandlers)` over a
+        // `std::vector<void (__cdecl*)(void)>`. The begin/end temporaries are
+        // function-pointer declarators and the loop variable is a reference.
+        let mut statements = vec![block(vec![
+            var("std::vector<void (__cdecl*)(void)> &<range>$L0"),
+            var("void (**<begin>$L0)()"),
+            var("void (**<end>$L0)()"),
+            block(vec![var("void (*&handler)()")]),
+        ])];
+
+        let mut names = HashMap::new();
+        names.insert(
+            "std::vector<void (__cdecl*)(void)>".to_string(),
+            "defaultHandlers".to_string(),
+        );
+
+        transform_iterator_loops(&mut statements, &names);
+
+        assert_eq!(statements.len(), 2);
+        assert_eq!(
+            statements[0],
+            cpp::Statement::Comment("for (auto handler : defaultHandlers)".to_string())
+        );
+        assert_eq!(statements[1], block(vec![]));
+    }
+
+    #[test]
+    fn range_temporaries_do_not_shadow_collection_fallback() {
+        // The collection is a temporary/expression with no discoverable name. The
+        // `<range>$L0` temporary shares its type, so it must not supply the
+        // collection name — the loop should fall back to `collection`.
+        let body = cpp::Block {
+            address: None,
+            statements: vec![block(vec![
+                var("std::vector<int> &<range>$L0"),
+                var("int *<begin>$L0"),
+                var("int *<end>$L0"),
+                block(vec![var("int arg")]),
+            ])],
+        };
+
+        let mut names = HashMap::new();
+        collect_local_names(&body, &mut names);
+
+        let mut statements = body.statements;
+        transform_iterator_loops(&mut statements, &names);
+
+        assert_eq!(
+            statements[0],
+            cpp::Statement::Comment("for (auto arg : collection)".to_string())
+        );
     }
 
     #[test]
